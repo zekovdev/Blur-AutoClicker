@@ -110,7 +110,10 @@ pub fn start_click_point_pick_inner(app: AppHandle) -> AppResult<()> {
         .click_point_pick_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    crate::overlay::show_click_point_pick_overlay(&app)?;
+    if let Err(error) = crate::overlay::show_click_point_pick_overlay(&app) {
+        cancel_click_point_pick_inner(&app);
+        return Err(error);
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel();
     std::thread::spawn(move || unsafe {
@@ -120,6 +123,16 @@ pub fn start_click_point_pick_inner(app: AppHandle) -> AppResult<()> {
         if mouse_hook.is_null() {
             let err = GetLastError();
             let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
+            return;
+        }
+
+        if !picker()
+            .lock()
+            .unwrap_or_else(poisoned_inner)
+            .active
+        {
+            UnhookWindowsHookEx(mouse_hook);
+            let _ = ready_tx.send(Err(AppError::ChannelFailure));
             return;
         }
 
@@ -136,12 +149,25 @@ pub fn start_click_point_pick_inner(app: AppHandle) -> AppResult<()> {
             return;
         }
 
-        {
+        let should_run = {
             let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-            runtime.mouse_hook = mouse_hook;
-            runtime.keyboard_hook = keyboard_hook;
-            runtime.thread_id = thread_id;
+            if runtime.active {
+                runtime.mouse_hook = mouse_hook;
+                runtime.keyboard_hook = keyboard_hook;
+                runtime.thread_id = thread_id;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !should_run {
+            UnhookWindowsHookEx(mouse_hook);
+            UnhookWindowsHookEx(keyboard_hook);
+            let _ = ready_tx.send(Err(AppError::ChannelFailure));
+            return;
         }
+
         let _ = ready_tx.send(Ok(()));
 
         let mut msg = std::mem::zeroed::<MSG>();
@@ -224,6 +250,14 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
+    if !picker()
+        .lock()
+        .unwrap_or_else(poisoned_inner)
+        .active
+    {
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+
     let message = wparam as u32;
     let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
 
@@ -267,6 +301,14 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 }
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+
+    if !picker()
+        .lock()
+        .unwrap_or_else(poisoned_inner)
+        .active
+    {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
